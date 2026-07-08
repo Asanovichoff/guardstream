@@ -190,12 +190,14 @@ DETECTORS = [
 ]
 
 
-def analyze_batch(events: list[dict]) -> dict | None:
+def analyze_batch(events: list[dict]) -> list[dict]:
+    """Run all detectors and return every match, highest confidence first."""
+    results = []
     for detector in DETECTORS:
         result = detector(events)
         if result:
-            return result
-    return None
+            results.append(result)
+    return sorted(results, key=lambda r: r["confidence"], reverse=True)
 
 
 # ── Redis writer (unchanged interface) ────────────────────────────────────────
@@ -288,9 +290,10 @@ def main() -> None:
 
         if should_flush:
             logger.info("Analyzing batch of %d events...", len(batch))
-            result = analyze_batch(batch)
-            if result:
-                write_results(result)
+            results = analyze_batch(batch)
+            if results:
+                for result in results:
+                    write_results(result)
             else:
                 logger.info("No attack pattern detected in this batch.")
             batch = []

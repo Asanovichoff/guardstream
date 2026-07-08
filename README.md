@@ -1,18 +1,19 @@
 # GuardStream
 
-**AI-powered API rate limiting and abuse detection using Kafka, Redis, and LLMs.**
+**API rate limiting and abuse detection using Kafka and Redis.**
 
-Most rate limiters count requests and block after N hits. GuardStream does something different: it separates the enforcement path from the intelligence path, so AI-driven behavioral analysis never adds latency to your API.
+Most rate limiters count requests and block after N hits. GuardStream does something different: it separates the enforcement path from the analysis path, so behavioral detection never adds latency to your API.
 
 ```
 Every API Request
       │
       ├── Fast Path (< 1ms): Redis Lua script
       │   Check blocklist → check sliding window → ALLOW or 429
-      │   Never waits for AI. Always instant.
+      │   Always instant. Never waits for analysis.
       │
-      └── Smart Path (async): Kafka → LLM Consumer
-          Detects attack patterns → writes block rules to Redis
+      └── Analysis Path (async): Kafka → Detection Consumer
+          Runs behavioral rules on batches of 50 events
+          Detected attacks → block rules written to Redis
           Fast path enforces them on the next request
 ```
 
@@ -20,9 +21,9 @@ Every API Request
 
 | Tool | Role | What breaks if you remove it |
 |------|------|-------------------------------|
-| **Redis** | Enforcement — sliding window counter + blocklist, < 1ms per request | Every request now needs a database query. Latency goes from 1ms to 20ms+. |
-| **Kafka** | Event log — two independent consumer groups (AI + stats) read the same stream | Replace with Redis Pub/Sub and the stats consumer loses events when it disconnects. No replay. No durability. |
-| **LLM** | Intelligence — detects behavioral patterns Redis can't count | Without AI, you only know a threshold was hit. Not whether it's a bot, a flash sale, or a credential stuffing attack. |
+| **Redis** | Enforcement — atomic sliding window + blocklist, < 1ms per request | Every request now needs a database query. Latency goes from 1ms to 20ms+. |
+| **Kafka** | Event log — two independent consumer groups read the same stream | Replace with Redis Pub/Sub and the stats consumer loses events when it disconnects. No replay. No durability. |
+| **Rule engine** | Intelligence — detects behavioral patterns Redis can't count | Without it, you only know a threshold was hit. Not whether it's a bot, a flash sale, or a credential stuffing attack. |
 
 ## Architecture
 
@@ -40,18 +41,19 @@ Every API Request
             │  Async: Kafka produce│──► Kafka (event log)
             └──────────────────────┘
                        │
-              Kafka topic: api-events (3 partitions)
+              Kafka topic: api-events
                        │
           ┌────────────┴────────────┐
           ▼                         ▼
   ┌──────────────┐         ┌──────────────────┐
-  │  ai-consumer │         │  stats-consumer  │
-  │  Group:      │         │  Group: stats    │
-  │  ai-guard    │         │                  │
-  │              │         │  ZINCRBY top_ips │
-  │  Batch 50    │         │  ZINCRBY top_eps │
-  │  events →    │         │  INCR blocked    │
-  │  LLM API     │         └──────────────────┘
+  │ detection-   │         │  stats-consumer  │
+  │ consumer     │         │  Group: stats    │
+  │ Group:       │         │                  │
+  │ ai-guard     │         │  ZINCRBY top_ips │
+  │              │         │  ZINCRBY top_eps │
+  │  Batch 50    │         │  INCR blocked    │
+  │  events →    │         └──────────────────┘
+  │  rule engine │
   │  → block IPs │
   │  → write     │
   │    alerts    │
@@ -64,22 +66,15 @@ Every API Request
 
 ## Quick Start
 
-**1. Clone and configure**
+**1. Clone and start**
 
 ```bash
 git clone https://github.com/Asanovichoff/guardstream.git
 cd guardstream
-cp .env.example .env
-# Edit .env and add your ANTHROPIC_API_KEY
-```
-
-**2. Start everything**
-
-```bash
 docker compose up --build
 ```
 
-Wait ~30 seconds for Kafka to be ready. All services start automatically.
+Wait ~30 seconds for Kafka to be ready. All services start automatically. No API keys required.
 
 | Service | URL |
 |---------|-----|
@@ -88,14 +83,14 @@ Wait ~30 seconds for Kafka to be ready. All services start automatically.
 | Kafka UI | http://localhost:8090 |
 | Redis Insight | http://localhost:5540 |
 
-**3. Run the attack simulator**
+**2. Run the attack simulator**
 
 ```bash
 pip install httpx
 python demo/attack_simulator.py
 ```
 
-Watch the dashboard. Within 30 seconds, the AI will detect the attack pattern and post a plain-English alert explaining what it found and why it blocked the IPs.
+Watch the dashboard. Within 30 seconds, the detection consumer will identify the attack pattern and post a plain-English alert explaining what it found and why it blocked the IPs.
 
 ## 60-Second Demo
 
@@ -114,7 +109,20 @@ open http://localhost:8080/dashboard
 You will see:
 1. Request counts climb in the "Top IPs" chart
 2. Blocked count increase as the rate limit kicks in
-3. An AI-generated alert appear with a plain-English explanation of the detected attack pattern
+3. An alert appear with a plain-English explanation of the detected attack pattern
+
+## Detection Rules
+
+The detection consumer runs four behavioral rules against each batch of 50 events. All four run on every batch — multiple alerts can fire simultaneously.
+
+| Rule | Signal | Threshold |
+|------|--------|-----------|
+| **Credential stuffing** | Many POST /login from ≤5 IPs sharing ≤2 User-Agents | ≥10 login events |
+| **Scraping** | Rapid GETs from one IP across multiple endpoints | avg gap < 2s, stdev < 0.5s |
+| **DDoS** | High volume from many distinct IPs in one window | ≥40 events from ≥8 IPs |
+| **Enumeration** | One IP accessing sequential numeric endpoint IDs | ≥5 consecutive IDs |
+
+Confidence scores are computed from signal strength (e.g. login count, timing variance). Results below 60% confidence are silently discarded.
 
 ## SDK Integration
 
@@ -137,7 +145,7 @@ When a request is blocked, the API returns:
 ```json
 {
   "error": "rate_limit_exceeded",
-  "reason": "Your IP was blocked after detecting a credential stuffing pattern. 23 login attempts in 45 seconds from 3 IPs sharing the same User-Agent string.",
+  "reason": "Detected credential stuffing: 23 login attempts from 3 IP(s) sharing 1 User-Agent string(s). High-frequency automated login attempts with shared tooling signatures indicate a coordinated credential stuffing attack.",
   "retry_after": 3600
 }
 ```
@@ -155,12 +163,14 @@ guardstream/
 │       ├── middleware.py       # Starlette BaseHTTPMiddleware
 │       └── lua/fast_path.lua   # Atomic blocklist + sliding window check
 ├── services/
-│   ├── ai-consumer/            # Consumer group: ai-guard → LLM → Redis
+│   ├── ai-consumer/            # Consumer group: ai-guard → rule engine → Redis
 │   ├── stats-consumer/         # Consumer group: stats → Redis ZSETs
 │   └── dashboard/              # FastAPI + live-updating HTML dashboard
 ├── demo/
 │   ├── demo_api.py             # Example protected API (3-line integration)
 │   └── attack_simulator.py     # Sends credential stuffing + scraping patterns
+├── tests/
+│   └── test_detectors.py       # Unit tests for all four detection rules
 └── scripts/
     └── load_test.sh            # 50 concurrent requests — proves atomicity
 ```
@@ -168,37 +178,35 @@ guardstream/
 ## Key Technical Decisions
 
 **Why a Lua script for the fast path?**
-The blocklist check and sliding window decrement are a single atomic Redis operation. No two requests can race — one will always win and the other will see the updated counter. Without the Lua script, two concurrent requests could both pass the check and both decrement past the limit.
+The blocklist check and sliding window are a single atomic Redis operation. No two requests can race — one will always win and the other will see the updated counter. Without the Lua script, two concurrent requests could both pass the check and both decrement past the limit.
 
 **Why Kafka instead of Redis Pub/Sub for the event stream?**
 Two consumer groups (`ai-guard` and `stats`) read from the same topic independently. If the stats consumer disconnects and reconnects, it replays from its last committed offset — no events lost. Redis Pub/Sub has no persistence: a disconnected subscriber loses all messages published while it was gone.
 
-**Why does the AI run asynchronously?**
-LLM inference takes 500ms–2s. If the enforcement path waited for AI on every request, your API's p99 latency would be 2000ms instead of < 1ms. By decoupling enforcement (Redis, synchronous) from intelligence (Kafka + LLM, async), both paths do exactly what they're good at.
+**Why does detection run asynchronously?**
+Behavioral analysis batches 50 events and runs four rule passes. If the enforcement path waited for this on every request, p99 latency would spike. By decoupling enforcement (Redis, synchronous) from analysis (Kafka, async), both paths do exactly what they're good at.
 
-**Why batch events before calling the LLM?**
-Individual events don't have enough signal. Sending 50 events at once lets the model see timing patterns, IP clusters, and endpoint sequences that are invisible in a single request. It also reduces API costs by ~50x compared to per-event calls.
+**Why batch 50 events before analyzing?**
+Individual events have no pattern signal. Batching lets the detector see timing distributions, IP clusters, and endpoint sequences that are invisible in a single request. A single login attempt is normal. 30 login attempts from 3 IPs in 18 seconds with identical User-Agents is a credential stuffing attack.
+
+**Why run all four detectors on every batch?**
+A real attack often triggers multiple rules simultaneously — a scraping session that also fits a DDoS profile should produce two alerts, not one. Each detector is independent so they compose without interference.
 
 ## Tech Stack
 
-- **Apache Kafka** (KRaft mode, no Zookeeper) — distributed event log
-- **Redis** — sub-millisecond enforcement, blocklist, stats, alert storage
+- **Apache Kafka** (KRaft mode, no Zookeeper) — durable event log with consumer group replay
+- **Redis** — sub-millisecond enforcement via Lua, blocklist, sorted set stats, alert storage
 - **Python / FastAPI** — services and SDK
-- **Claude Haiku / Gemini Flash / GPT-4o-mini** — pluggable LLM backend for attack pattern detection
-- **Docker Compose** — one-command local deployment
+- **Docker Compose** — one-command local deployment, no external dependencies
 
 ## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LLM_PROVIDER` | `anthropic` | `anthropic`, `gemini`, or `openai` |
-| `ANTHROPIC_API_KEY` | — | Required when `LLM_PROVIDER=anthropic` |
-| `GEMINI_API_KEY` | — | Required when `LLM_PROVIDER=gemini` |
-| `OPENAI_API_KEY` | — | Required when `LLM_PROVIDER=openai` |
-| `AI_BATCH_SIZE` | `50` | Events per LLM call |
-| `AI_BATCH_INTERVAL` | `30` | Seconds between LLM calls |
-| `BLOCK_TTL_SECONDS` | `3600` | How long to block a flagged IP |
+| `AI_BATCH_SIZE` | `50` | Events per detection run |
+| `AI_BATCH_INTERVAL` | `30` | Max seconds between detection runs |
+| `BLOCK_TTL_SECONDS` | `3600` | How long a blocked IP stays blocked |
 
 ---
 
-Built with Kafka, Redis, and Claude. Designed as a portfolio project demonstrating distributed systems, event streaming, and applied AI.
+Built with Kafka and Redis. Designed as a portfolio project demonstrating distributed systems, event streaming, and real-time behavioral analysis.
