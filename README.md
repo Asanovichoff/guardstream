@@ -184,15 +184,17 @@ Individual events don't have enough signal. Sending 50 events at once lets the m
 - **Apache Kafka** (KRaft mode, no Zookeeper) — distributed event log
 - **Redis** — sub-millisecond enforcement, blocklist, stats, alert storage
 - **Python / FastAPI** — services and SDK
-- **Claude Haiku** (Anthropic) — attack pattern detection and explanation
+- **Claude Haiku / Gemini Flash / GPT-4o-mini** — pluggable LLM backend for attack pattern detection
 - **Docker Compose** — one-command local deployment
 
 ## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ANTHROPIC_API_KEY` | required | Anthropic API key for Claude Haiku |
-| `LLM_PROVIDER` | `anthropic` | `anthropic` or `openai` |
+| `LLM_PROVIDER` | `anthropic` | `anthropic`, `gemini`, or `openai` |
+| `ANTHROPIC_API_KEY` | — | Required when `LLM_PROVIDER=anthropic` |
+| `GEMINI_API_KEY` | — | Required when `LLM_PROVIDER=gemini` |
+| `OPENAI_API_KEY` | — | Required when `LLM_PROVIDER=openai` |
 | `AI_BATCH_SIZE` | `50` | Events per LLM call |
 | `AI_BATCH_INTERVAL` | `30` | Seconds between LLM calls |
 | `BLOCK_TTL_SECONDS` | `3600` | How long to block a flagged IP |

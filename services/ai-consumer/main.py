@@ -99,7 +99,17 @@ def _call_provider(prompt: str) -> str:
         )
         return resp.choices[0].message.content
 
-    raise ValueError(f"Unknown LLM_PROVIDER: {LLM_PROVIDER!r}. Set to 'anthropic' or 'openai'.")
+    if LLM_PROVIDER == "gemini":
+        import google.generativeai as genai
+        genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+        model = genai.GenerativeModel(
+            model_name="gemini-2.0-flash-lite",
+            system_instruction=SYSTEM_PROMPT,
+        )
+        resp = model.generate_content(prompt)
+        return resp.text
+
+    raise ValueError(f"Unknown LLM_PROVIDER: {LLM_PROVIDER!r}. Set to 'anthropic', 'openai', or 'gemini'.")
 
 
 def write_results(result: dict) -> None:
