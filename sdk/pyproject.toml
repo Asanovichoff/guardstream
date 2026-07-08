@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "guardstream"
+version = "0.1.0"
+description = "AI-powered API rate limiting and abuse detection"
+requires-python = ">=3.11"
+dependencies = [
+    "redis>=5.0.0",
+    "confluent-kafka>=2.3.0",
+    "starlette>=0.36.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.setuptools.package-data]
+guardstream = ["lua/*.lua"]

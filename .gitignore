@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+.env
+.venv/
+venv/
+env/
+
+.DS_Store
+*.log
+
+# Docker volumes
+kafka-data/
+redis-data/
