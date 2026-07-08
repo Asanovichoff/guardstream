@@ -1,13 +1,16 @@
 """
-ai-consumer: reads api-events from Kafka, batches them, calls an LLM to detect
-attack patterns, and writes block rules + plain-English alerts to Redis.
+ai-consumer: reads api-events from Kafka, batches them, runs rule-based
+behavioral analysis to detect attack patterns, then writes block rules
+and plain-English alerts to Redis.
 """
 import json
 import logging
 import os
 import time
 import uuid
+from collections import defaultdict
 from datetime import datetime, timezone
+from statistics import mean, stdev
 
 import redis
 from confluent_kafka import Consumer, KafkaError
@@ -23,94 +26,179 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 AI_BATCH_SIZE = int(os.getenv("AI_BATCH_SIZE", "50"))
 AI_BATCH_INTERVAL = int(os.getenv("AI_BATCH_INTERVAL", "30"))
 BLOCK_TTL = int(os.getenv("BLOCK_TTL_SECONDS", "3600"))
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "anthropic")
 
 redis_client = redis.from_url(REDIS_URL, decode_responses=True)
 
-SYSTEM_PROMPT = (
-    "You are a security analyst reviewing API traffic logs. "
-    "Identify the single most significant attack pattern. "
-    "Respond ONLY with valid JSON — no prose, no markdown fences."
-)
 
-RESPONSE_SCHEMA = """{
-  "pattern_type": "credential_stuffing | scraping | ddos | enumeration | suspicious | none",
-  "affected_ips": ["ip1", "ip2"],
-  "confidence": 0.0,
-  "explanation": "one plain-English paragraph describing what you observed",
-  "recommended_action": "block | rate_limit | watch | none",
-  "block_ttl_seconds": 3600
-}"""
+# ── Detection rules ────────────────────────────────────────────────────────────
+
+def _parse_ts(ts: str) -> float:
+    """ISO timestamp → unix float, returns 0.0 on failure."""
+    try:
+        return datetime.fromisoformat(ts).timestamp()
+    except Exception:
+        return 0.0
 
 
-def build_prompt(events: list) -> str:
-    return (
-        f"Here are {len(events)} API events from the last {AI_BATCH_INTERVAL} seconds:\n"
-        f"{json.dumps(events, indent=2)}\n\n"
-        "Analyze for: credential stuffing (many logins, few IPs), scraping (rapid "
-        "sequential reads), DDoS (high volume from many IPs), enumeration (sequential "
-        "IDs or endpoints), suspicious timing (bots have very low inter-request variance).\n\n"
-        f"Respond with exactly this JSON shape:\n{RESPONSE_SCHEMA}"
-    )
+def detect_credential_stuffing(events: list[dict]) -> dict | None:
+    """Many login POSTs from a small IP cluster sharing the same User-Agent."""
+    login_events = [
+        e for e in events
+        if e.get("method") == "POST" and "login" in e.get("endpoint", "")
+    ]
+    if len(login_events) < 10:
+        return None
 
+    by_ip: dict[str, list] = defaultdict(list)
+    for e in login_events:
+        by_ip[e["ip"]].append(e)
 
-def call_llm(events: list) -> dict | None:
-    prompt = build_prompt(events)
+    unique_ips = len(by_ip)
+    unique_uas = len({e.get("user_agent", "") for e in login_events})
 
-    for attempt in range(2):
-        try:
-            text = _call_provider(prompt if attempt == 0 else (
-                "Your previous response was not valid JSON. "
-                "Respond with only the JSON object, no other text."
-            ))
-            return json.loads(text.strip())
-        except json.JSONDecodeError:
-            logger.warning("LLM returned invalid JSON (attempt %d/2)", attempt + 1)
-        except Exception as exc:
-            logger.error("LLM call failed: %s", exc)
-            return None
-
-    logger.error("LLM retry exhausted — skipping batch")
+    if unique_ips <= 5 and unique_uas <= 2:
+        top_ips = sorted(by_ip, key=lambda ip: len(by_ip[ip]), reverse=True)
+        confidence = min(0.95, 0.6 + len(login_events) * 0.01)
+        return {
+            "pattern_type": "credential_stuffing",
+            "affected_ips": top_ips[:5],
+            "confidence": round(confidence, 2),
+            "explanation": (
+                f"Detected credential stuffing: {len(login_events)} login attempts "
+                f"from {unique_ips} IP(s) sharing {unique_uas} User-Agent string(s). "
+                f"High-frequency automated login attempts with shared tooling signatures "
+                f"indicate a coordinated credential stuffing attack."
+            ),
+            "recommended_action": "block",
+            "block_ttl_seconds": BLOCK_TTL,
+        }
     return None
 
 
-def _call_provider(prompt: str) -> str:
-    if LLM_PROVIDER == "anthropic":
-        import anthropic
-        client = anthropic.Anthropic()
-        msg = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=512,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": prompt}],
+def detect_scraping(events: list[dict]) -> dict | None:
+    """Single IP making rapid GETs across multiple endpoints with low timing variance."""
+    by_ip: dict[str, list] = defaultdict(list)
+    for e in events:
+        by_ip[e["ip"]].append(e)
+
+    for ip, ip_events in by_ip.items():
+        get_events = [e for e in ip_events if e.get("method") == "GET"]
+        if len(get_events) < 10:
+            continue
+
+        endpoints = {e.get("endpoint", "") for e in get_events}
+        timestamps = sorted(
+            _parse_ts(e["timestamp"]) for e in get_events if e.get("timestamp")
         )
-        return msg.content[0].text
 
-    if LLM_PROVIDER == "openai":
-        from openai import OpenAI
-        client = OpenAI()
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            max_tokens=512,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-        )
-        return resp.choices[0].message.content
+        if len(timestamps) < 3 or len(endpoints) < 2:
+            continue
 
-    if LLM_PROVIDER == "gemini":
-        import google.generativeai as genai
-        genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-        model = genai.GenerativeModel(
-            model_name="gemini-2.0-flash-lite",
-            system_instruction=SYSTEM_PROMPT,
-        )
-        resp = model.generate_content(prompt)
-        return resp.text
+        gaps = [timestamps[i + 1] - timestamps[i] for i in range(len(timestamps) - 1)]
+        avg_gap = mean(gaps)
+        gap_stdev = stdev(gaps) if len(gaps) > 1 else 0.0
 
-    raise ValueError(f"Unknown LLM_PROVIDER: {LLM_PROVIDER!r}. Set to 'anthropic', 'openai', or 'gemini'.")
+        # Fast (< 2s avg) with low variance (< 0.5s stdev) = bot
+        if avg_gap < 2.0 and gap_stdev < 0.5:
+            confidence = min(0.95, 0.65 + (1.0 - min(avg_gap, 1.0)) * 0.3)
+            return {
+                "pattern_type": "scraping",
+                "affected_ips": [ip],
+                "confidence": round(confidence, 2),
+                "explanation": (
+                    f"Detected scraping from {ip}: {len(get_events)} GET requests "
+                    f"across {len(endpoints)} endpoint(s) with avg inter-request delay "
+                    f"of {avg_gap:.2f}s (stdev {gap_stdev:.3f}s). "
+                    f"Low timing variance is a strong bot indicator."
+                ),
+                "recommended_action": "block",
+                "block_ttl_seconds": BLOCK_TTL,
+            }
+    return None
 
+
+def detect_ddos(events: list[dict]) -> dict | None:
+    """Unusually high volume spread across many IPs in the batch window."""
+    if len(events) < 40:
+        return None
+
+    by_ip: dict[str, list] = defaultdict(list)
+    for e in events:
+        by_ip[e["ip"]].append(e)
+
+    unique_ips = len(by_ip)
+    if unique_ips < 8:
+        return None
+
+    top_ips = sorted(by_ip, key=lambda ip: len(by_ip[ip]), reverse=True)[:10]
+    confidence = min(0.90, 0.60 + unique_ips * 0.02)
+    return {
+        "pattern_type": "ddos",
+        "affected_ips": top_ips,
+        "confidence": round(confidence, 2),
+        "explanation": (
+            f"Detected potential DDoS: {len(events)} requests from {unique_ips} "
+            f"distinct IPs in a {AI_BATCH_INTERVAL}s window. "
+            f"High-volume distributed traffic may indicate a volumetric attack."
+        ),
+        "recommended_action": "block",
+        "block_ttl_seconds": BLOCK_TTL,
+    }
+
+
+def detect_enumeration(events: list[dict]) -> dict | None:
+    """Single IP sequentially hitting numeric endpoint IDs."""
+    import re
+    by_ip: dict[str, list] = defaultdict(list)
+    for e in events:
+        by_ip[e["ip"]].append(e)
+
+    for ip, ip_events in by_ip.items():
+        if len(ip_events) < 8:
+            continue
+        nums = []
+        for e in ip_events:
+            m = re.search(r"/(\d+)", e.get("endpoint", ""))
+            if m:
+                nums.append(int(m.group(1)))
+        if len(nums) < 5:
+            continue
+        nums_sorted = sorted(nums)
+        diffs = [nums_sorted[i + 1] - nums_sorted[i] for i in range(len(nums_sorted) - 1)]
+        if all(d == 1 for d in diffs):
+            return {
+                "pattern_type": "enumeration",
+                "affected_ips": [ip],
+                "confidence": 0.88,
+                "explanation": (
+                    f"Detected enumeration from {ip}: sequentially accessed "
+                    f"IDs {nums_sorted[0]}–{nums_sorted[-1]} across "
+                    f"{len(nums)} endpoints in order. "
+                    f"Sequential ID scanning indicates automated data harvesting."
+                ),
+                "recommended_action": "block",
+                "block_ttl_seconds": BLOCK_TTL,
+            }
+    return None
+
+
+DETECTORS = [
+    detect_credential_stuffing,
+    detect_scraping,
+    detect_ddos,
+    detect_enumeration,
+]
+
+
+def analyze_batch(events: list[dict]) -> dict | None:
+    for detector in DETECTORS:
+        result = detector(events)
+        if result:
+            return result
+    return None
+
+
+# ── Redis writer (unchanged interface) ────────────────────────────────────────
 
 def write_results(result: dict) -> None:
     if result.get("pattern_type") == "none":
@@ -127,7 +215,7 @@ def write_results(result: dict) -> None:
     if action not in ("block", "rate_limit"):
         return
 
-    explanation = result.get("explanation", "Suspicious traffic detected by GuardStream AI.")
+    explanation = result.get("explanation", "Suspicious traffic detected by GuardStream.")
     ttl = result.get("block_ttl_seconds", BLOCK_TTL)
     alert_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
@@ -159,6 +247,8 @@ def write_results(result: dict) -> None:
     )
 
 
+# ── Kafka consumer loop ────────────────────────────────────────────────────────
+
 def main() -> None:
     consumer = Consumer({
         "bootstrap.servers": KAFKA_BOOTSTRAP,
@@ -167,7 +257,10 @@ def main() -> None:
         "enable.auto.commit": False,
     })
     consumer.subscribe(["api-events"])
-    logger.info("Started. Waiting for events (batch_size=%d, interval=%ds)...", AI_BATCH_SIZE, AI_BATCH_INTERVAL)
+    logger.info(
+        "Started (rule-based mode). Waiting for events (batch_size=%d, interval=%ds)...",
+        AI_BATCH_SIZE, AI_BATCH_INTERVAL,
+    )
 
     batch: list[dict] = []
     last_flush = time.time()
@@ -188,13 +281,18 @@ def main() -> None:
             consumer.commit(asynchronous=False)
 
         now = time.time()
-        should_flush = len(batch) >= AI_BATCH_SIZE or (batch and now - last_flush >= AI_BATCH_INTERVAL)
+        should_flush = (
+            len(batch) >= AI_BATCH_SIZE
+            or (batch and now - last_flush >= AI_BATCH_INTERVAL)
+        )
 
         if should_flush:
             logger.info("Analyzing batch of %d events...", len(batch))
-            result = call_llm(batch)
+            result = analyze_batch(batch)
             if result:
                 write_results(result)
+            else:
+                logger.info("No attack pattern detected in this batch.")
             batch = []
             last_flush = now
 
