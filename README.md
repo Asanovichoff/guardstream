@@ -175,6 +175,87 @@ guardstream/
     └── load_test.sh            # 50 concurrent requests — proves atomicity
 ```
 
+## AWS Architecture
+
+For production deployment, GuardStream replaces every local container with a managed AWS service. The application code doesn't change — only connection strings.
+
+```
+                         Internet
+                             │
+                     ┌───────▼────────┐
+                     │  AWS ALB        │  HTTP load balancer
+                     └───────┬────────┘
+                             │
+              ┌──────────────▼──────────────┐
+              │  Amazon ECS / Fargate        │  all 4 containers
+              │  demo │ ai-consumer          │  no servers to manage
+              │  stats-consumer │ dashboard  │
+              └──┬───────────┬─────────────┘
+                 │           │
+     ┌───────────▼──┐  ┌────▼──────────────┐
+     │ Amazon MSK   │  │ Amazon ElastiCache │
+     │ (Kafka)      │  │ (Redis, Multi-AZ)  │
+     └──────────────┘  └───────────────────┘
+                 │
+     ┌───────────▼──────────────────────────┐
+     │          ai-consumer                  │
+     │  Attack detected → writes to:         │
+     │                                       │
+     │  ┌──────────┐  ┌─────┐  ┌─────────┐ │
+     │  │ Redis    │  │ S3  │  │ SNS     │ │
+     │  │ (blocks  │  │ (90-│  │ (email/ │ │
+     │  │ +alerts) │  │ day │  │ Slack/  │ │
+     │  │          │  │ arc-│  │ Pager-  │ │
+     │  └──────────┘  │ hiv)│  │ Duty)   │ │
+     │                └─────┘  └─────────┘ │
+     │  ┌───────────────────────────────┐   │
+     │  │ CloudWatch (metrics + alarms) │   │
+     │  └───────────────────────────────┘   │
+     └──────────────────────────────────────┘
+                 │
+     ┌───────────▼──────────────────────────┐
+     │  Amazon RDS Aurora Serverless        │
+     │  Persistent block history            │
+     │  (survives Redis restarts)           │
+     └──────────────────────────────────────┘
+```
+
+| AWS Service | Role | Why not the simpler alternative |
+|------------|------|----------------------------------|
+| **Amazon MSK** | Managed Kafka — no broker management | Self-managed Kafka requires capacity planning, patching, replication tuning |
+| **Amazon ElastiCache** | Managed Redis with Multi-AZ automatic failover | Single Redis node has no HA; restart clears all blocks |
+| **Amazon ECS/Fargate** | Run containers without managing EC2 instances | EC2 requires OS patching, capacity planning, autoscaling config |
+| **Amazon S3** | Permanent alert archive with 90-day retention | Redis alerts expire after 24h — no audit trail |
+| **Amazon SNS** | Push notifications to email, Slack, PagerDuty | Requires no per-destination integration code |
+| **Amazon CloudWatch** | Metrics, log aggregation, threshold alarms | Replaces the custom `/api/metrics` endpoint with a managed dashboard |
+| **Amazon RDS Aurora Serverless** | Persistent block history | Redis is ephemeral — a restart unblocks all flagged IPs |
+| **AWS ALB** | Layer 7 load balancer with health checks | Direct port binding has no HA, no SSL termination |
+| **Amazon ECR** | Private container image registry | DockerHub has rate limits and public exposure |
+| **AWS Secrets Manager** | Secure credential storage with rotation | Plain `.env` files with credentials in plaintext |
+| **Amazon VPC + IAM** | Network isolation, least-privilege access | Containers reachable from the internet without VPC |
+
+**Local development with LocalStack:**
+
+All AWS integrations are testable locally without an AWS account using [LocalStack](https://localstack.cloud). The S3 bucket, SNS topic, and CloudWatch log group are created automatically on `docker compose up`.
+
+```bash
+docker compose up --build   # starts LocalStack alongside Kafka and Redis
+python demo/attack_simulator.py
+# ai-consumer archives alerts to LocalStack S3 and publishes SNS notifications
+```
+
+**Deploy to real AWS:**
+
+```bash
+cd infrastructure/terraform
+terraform init
+terraform apply -var="db_password=<password>" -var="alert_email=you@example.com"
+```
+
+The Terraform provisions all 11 AWS services and outputs the ALB URL, ECR repository URLs, and MSK bootstrap address.
+
+---
+
 ## How the Detectors Work
 
 Each detector answers the question: "does this batch of 50 events look like a known attack pattern?" All four run on every batch — multiple can fire simultaneously.

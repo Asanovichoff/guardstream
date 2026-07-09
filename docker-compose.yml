@@ -68,6 +68,23 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  localstack:
+    image: localstack/localstack:3.4
+    ports:
+      - "4566:4566"
+    environment:
+      SERVICES: s3,sns,cloudwatch,logs
+      DEFAULT_REGION: us-east-1
+      EAGER_SERVICE_LOADING: 1
+    volumes:
+      - ./infrastructure/localstack_init.sh:/etc/localstack/init/ready.d/init.sh:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
   ai-consumer:
     build:
       context: .
@@ -78,10 +95,20 @@ services:
       AI_BATCH_SIZE: "50"
       AI_BATCH_INTERVAL: "30"
       BLOCK_TTL_SECONDS: "3600"
+      # AWS (LocalStack for local dev — swap for real AWS values in production)
+      AWS_REGION: us-east-1
+      AWS_ENDPOINT_URL: http://localstack:4566
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      S3_BUCKET: guardstream-alerts
+      SNS_TOPIC_ARN: arn:aws:sns:us-east-1:000000000000:guardstream-attacks
+      CW_NAMESPACE: GuardStream
     depends_on:
       kafka:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      localstack:
         condition: service_healthy
     restart: unless-stopped
 

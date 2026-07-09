@@ -2,6 +2,11 @@
 ai-consumer: reads api-events from Kafka, batches them, runs rule-based
 behavioral analysis to detect attack patterns, then writes block rules
 and plain-English alerts to Redis.
+
+AWS integrations (all optional — skip gracefully if env vars not set):
+  S3       → archive every alert as JSON for permanent storage
+  SNS      → push attack notifications to email / Slack / PagerDuty
+  CloudWatch → emit custom metrics per batch (events processed, IPs blocked)
 """
 import json
 import logging
@@ -12,7 +17,9 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from statistics import mean, stdev
 
+import boto3
 import redis
+from botocore.exceptions import BotoCoreError, ClientError
 from confluent_kafka import Consumer, KafkaError
 
 logging.basicConfig(
@@ -21,19 +28,114 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
-AI_BATCH_SIZE = int(os.getenv("AI_BATCH_SIZE", "50"))
+# ── Config ─────────────────────────────────────────────────────────────────────
+
+KAFKA_BOOTSTRAP   = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+REDIS_URL         = os.getenv("REDIS_URL", "redis://localhost:6379")
+AI_BATCH_SIZE     = int(os.getenv("AI_BATCH_SIZE", "50"))
 AI_BATCH_INTERVAL = int(os.getenv("AI_BATCH_INTERVAL", "30"))
-BLOCK_TTL = int(os.getenv("BLOCK_TTL_SECONDS", "3600"))
+BLOCK_TTL         = int(os.getenv("BLOCK_TTL_SECONDS", "3600"))
+
+# AWS — all optional; set AWS_ENDPOINT_URL=http://localstack:4566 for local dev
+AWS_REGION       = os.getenv("AWS_REGION", "us-east-1")
+AWS_ENDPOINT_URL = os.getenv("AWS_ENDPOINT_URL")          # LocalStack endpoint
+S3_BUCKET        = os.getenv("S3_BUCKET", "")             # e.g. guardstream-alerts
+SNS_TOPIC_ARN    = os.getenv("SNS_TOPIC_ARN", "")         # e.g. arn:aws:sns:...
+CW_NAMESPACE     = os.getenv("CW_NAMESPACE", "GuardStream")
 
 redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+
+
+# ── AWS helpers ────────────────────────────────────────────────────────────────
+
+def _aws(service: str):
+    kwargs = {"region_name": AWS_REGION}
+    if AWS_ENDPOINT_URL:
+        kwargs["endpoint_url"] = AWS_ENDPOINT_URL
+    return boto3.client(service, **kwargs)
+
+
+def archive_to_s3(alert_id: str, result: dict) -> None:
+    """Write the full alert JSON to S3 for permanent storage."""
+    if not S3_BUCKET:
+        return
+    try:
+        key = f"alerts/{datetime.now(timezone.utc).strftime('%Y/%m/%d')}/{alert_id}.json"
+        _aws("s3").put_object(
+            Bucket=S3_BUCKET,
+            Key=key,
+            Body=json.dumps(result, default=str),
+            ContentType="application/json",
+        )
+        logger.info("Archived to s3://%s/%s", S3_BUCKET, key)
+    except (BotoCoreError, ClientError) as exc:
+        logger.warning("S3 archive failed: %s", exc)
+
+
+def notify_sns(result: dict) -> None:
+    """Publish an attack notification to SNS (email, Slack, PagerDuty, etc.)."""
+    if not SNS_TOPIC_ARN:
+        return
+    try:
+        pattern = result.get("pattern_type", "unknown").replace("_", " ").title()
+        ips = ", ".join(result.get("affected_ips", []))
+        conf = int(result.get("confidence", 0) * 100)
+        _aws("sns").publish(
+            TopicArn=SNS_TOPIC_ARN,
+            Subject=f"[GuardStream] {pattern} detected ({conf}% confidence)",
+            Message=(
+                f"Attack pattern: {pattern}\n"
+                f"Confidence: {conf}%\n"
+                f"Affected IPs: {ips}\n\n"
+                f"{result.get('explanation', '')}\n\n"
+                f"Action taken: {result.get('recommended_action', 'none')}"
+            ),
+            MessageAttributes={
+                "pattern_type": {
+                    "DataType": "String",
+                    "StringValue": result.get("pattern_type", "unknown"),
+                }
+            },
+        )
+        logger.info("SNS notification sent for %s", result.get("pattern_type"))
+    except (BotoCoreError, ClientError) as exc:
+        logger.warning("SNS notification failed: %s", exc)
+
+
+def push_cloudwatch_metrics(batch_size: int, results: list[dict]) -> None:
+    """Push batch processing metrics to CloudWatch."""
+    try:
+        ips_blocked = sum(len(r.get("affected_ips", [])) for r in results)
+        patterns = len(results)
+        _aws("cloudwatch").put_metric_data(
+            Namespace=CW_NAMESPACE,
+            MetricData=[
+                {
+                    "MetricName": "EventsProcessed",
+                    "Value": batch_size,
+                    "Unit": "Count",
+                },
+                {
+                    "MetricName": "PatternsDetected",
+                    "Value": patterns,
+                    "Unit": "Count",
+                },
+                {
+                    "MetricName": "IPsBlocked",
+                    "Value": ips_blocked,
+                    "Unit": "Count",
+                },
+            ],
+        )
+        logger.info("CloudWatch metrics pushed (events=%d, patterns=%d, ips=%d)",
+                    batch_size, patterns, ips_blocked)
+    except (BotoCoreError, ClientError) as exc:
+        logger.warning("CloudWatch push failed: %s", exc)
 
 
 # ── Detection rules ────────────────────────────────────────────────────────────
 
 def _parse_ts(ts: str) -> float:
-    """ISO timestamp → unix float, returns 0.0 on failure."""
     try:
         return datetime.fromisoformat(ts).timestamp()
     except Exception:
@@ -41,7 +143,6 @@ def _parse_ts(ts: str) -> float:
 
 
 def detect_credential_stuffing(events: list[dict]) -> dict | None:
-    """Many login POSTs from a small IP cluster sharing the same User-Agent."""
     login_events = [
         e for e in events
         if e.get("method") == "POST" and "login" in e.get("endpoint", "")
@@ -76,7 +177,6 @@ def detect_credential_stuffing(events: list[dict]) -> dict | None:
 
 
 def detect_scraping(events: list[dict]) -> dict | None:
-    """Single IP making rapid GETs across multiple endpoints with low timing variance."""
     by_ip: dict[str, list] = defaultdict(list)
     for e in events:
         by_ip[e["ip"]].append(e)
@@ -98,7 +198,6 @@ def detect_scraping(events: list[dict]) -> dict | None:
         avg_gap = mean(gaps)
         gap_stdev = stdev(gaps) if len(gaps) > 1 else 0.0
 
-        # Fast (< 2s avg) with low variance (< 0.5s stdev) = bot
         if avg_gap < 2.0 and gap_stdev < 0.5:
             confidence = min(0.95, 0.65 + (1.0 - min(avg_gap, 1.0)) * 0.3)
             return {
@@ -118,7 +217,6 @@ def detect_scraping(events: list[dict]) -> dict | None:
 
 
 def detect_ddos(events: list[dict]) -> dict | None:
-    """Unusually high volume spread across many IPs in the batch window."""
     if len(events) < 40:
         return None
 
@@ -147,7 +245,6 @@ def detect_ddos(events: list[dict]) -> dict | None:
 
 
 def detect_enumeration(events: list[dict]) -> dict | None:
-    """Single IP sequentially hitting numeric endpoint IDs."""
     import re
     by_ip: dict[str, list] = defaultdict(list)
     for e in events:
@@ -200,17 +297,12 @@ def analyze_batch(events: list[dict]) -> list[dict]:
     return sorted(results, key=lambda r: r["confidence"], reverse=True)
 
 
-# ── Redis writer (unchanged interface) ────────────────────────────────────────
+# ── Writers ────────────────────────────────────────────────────────────────────
 
 def write_results(result: dict) -> None:
     if result.get("pattern_type") == "none":
         return
     if result.get("confidence", 0) < 0.6:
-        logger.info(
-            "Pattern '%s' detected but confidence %.0f%% < 60%% — skipping",
-            result.get("pattern_type"),
-            result.get("confidence", 0) * 100,
-        )
         return
 
     action = result.get("recommended_action", "none")
@@ -223,30 +315,35 @@ def write_results(result: dict) -> None:
     now = datetime.now(timezone.utc).isoformat()
     affected_ips = result.get("affected_ips", [])
 
+    # Redis — fast-path enforcement and dashboard
     for ip in affected_ips:
         redis_client.setex(f"gs:blocked:{ip}", ttl, "1")
         redis_client.setex(f"gs:blocked:{ip}:reason", ttl, explanation)
         logger.info("Blocked %s for %ds — %s", ip, ttl, explanation[:100])
 
-    redis_client.hset(f"gs:alert:{alert_id}", mapping={
+    alert_payload = {
         "pattern_type": result.get("pattern_type", ""),
         "ips": json.dumps(affected_ips),
         "explanation": explanation,
         "action": action,
         "confidence": str(result.get("confidence", 0)),
         "ts": now,
-    })
+    }
+    redis_client.hset(f"gs:alert:{alert_id}", mapping=alert_payload)
     redis_client.expire(f"gs:alert:{alert_id}", 86400)
     redis_client.lpush("gs:alerts", alert_id)
     redis_client.ltrim("gs:alerts", 0, 99)
 
     logger.info(
         "Alert %s: %s (%.0f%% confidence, %d IPs affected)",
-        alert_id,
-        result.get("pattern_type"),
-        result.get("confidence", 0) * 100,
-        len(affected_ips),
+        alert_id, result.get("pattern_type"),
+        result.get("confidence", 0) * 100, len(affected_ips),
     )
+
+    # AWS — archive to S3 and notify via SNS
+    full_result = {**result, "alert_id": alert_id, "ts": now}
+    archive_to_s3(alert_id, full_result)
+    notify_sns(result)
 
 
 # ── Kafka consumer loop ────────────────────────────────────────────────────────
@@ -296,6 +393,10 @@ def main() -> None:
                     write_results(result)
             else:
                 logger.info("No attack pattern detected in this batch.")
+
+            # Push CloudWatch metrics regardless of whether an attack was found
+            push_cloudwatch_metrics(len(batch), results)
+
             batch = []
             last_flush = now
 
