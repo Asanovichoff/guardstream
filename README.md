@@ -175,6 +175,128 @@ guardstream/
     └── load_test.sh            # 50 concurrent requests — proves atomicity
 ```
 
+## How the Detectors Work
+
+Each detector answers the question: "does this batch of 50 events look like a known attack pattern?" All four run on every batch — multiple can fire simultaneously.
+
+### Credential Stuffing
+
+**What it is:** Attackers buy leaked username/password lists from data breaches (billions exist) and automatically try each pair against your login endpoint, hoping some users reused passwords. One attacker can test thousands of credentials per minute.
+
+**The signal:** Human login traffic is sparse and varied — different users, different browsers, different timing. An automated credential stuffing tool reveals itself through uniformity: many attempts from a small cluster of IPs, all using the same HTTP client (same User-Agent string).
+
+**The rule:**
+```
+≥10 POST /login events
+AND ≤5 distinct source IPs
+AND ≤2 distinct User-Agent strings
+→ credential_stuffing
+```
+
+**Why this works without false positives:** Legitimate users log in from their own IP with their own browser. Even a shared office network (many users, one IP) would have many different User-Agents. The combination of IP clustering *and* User-Agent uniformity is the fingerprint of automation.
+
+---
+
+### Scraping
+
+**What it is:** Bots systematically read your API to harvest data — product catalogs, pricing, user profiles. The attacker wants all your data, not a specific record.
+
+**The signal:** Humans browse at irregular speeds (read an article, click, wait, click again). Bots run at machine speed: constant, low-variance intervals because they're just executing a loop with `time.sleep(0.05)`.
+
+**The rule:**
+```
+≥10 GET requests from one IP
+AND ≥2 distinct endpoints
+AND avg inter-request gap < 2s
+AND stdev of gaps < 0.5s
+→ scraping
+```
+
+**The math:** Standard deviation measures how much the gaps vary. Human traffic: gaps of 0.5s, 3s, 12s, 0.8s — high stdev. Bot traffic: 47ms, 52ms, 49ms, 51ms — near-zero stdev. The stdev threshold distinguishes a fast human from a slow bot.
+
+---
+
+### DDoS
+
+**What it is:** Overwhelming your server with traffic from many sources simultaneously, making it unavailable to legitimate users.
+
+**The signal:** A legitimate traffic spike (flash sale, viral post) comes from many IPs but with organic timing. A volumetric attack has extremely high request rates from a large number of coordinated sources simultaneously.
+
+**The rule:**
+```
+≥40 events in the batch window
+AND ≥8 distinct source IPs
+→ ddos
+```
+
+---
+
+### Enumeration
+
+**What it is:** Systematically probing sequential IDs to discover resources — scanning `/api/users/1`, `/api/users/2`, `/api/users/3`... to find all user records, or `/api/orders/1000`... to discover order volumes.
+
+**The signal:** Real user traffic accesses specific IDs based on actual links or searches. Sequential integer access is a machine behavior.
+
+**The rule:**
+```
+≥8 requests from one IP
+AND ≥5 endpoint IDs match /\d+/
+AND those IDs are consecutive integers
+→ enumeration
+```
+
+---
+
+## Failure Modes
+
+A distributed system's failure behavior is as important as its happy path.
+
+| Component fails | Fast path | Detection | Recovery |
+|----------------|-----------|-----------|----------|
+| **Kafka down** | Unaffected — Redis-only | Pauses. Existing blocks stay in Redis. | Consumer resumes from last committed offset when Kafka comes back. Missed events are not replayed (`auto.offset.reset=latest`). |
+| **Redis down** | **Fails open** — requests are allowed through with an error logged. See below. | Pauses — cannot write new blocks. | When Redis recovers, all in-memory state (blocks, counters) is gone. Blocks are not persisted by default. |
+| **Detection consumer crashes** | Unaffected | Pauses. Existing blocks stay active until TTL. | Docker restarts the container automatically (`restart: unless-stopped`). Consumer replays from its committed offset. |
+| **Stats consumer crashes** | Unaffected | Unaffected | Dashboard counters go stale. Auto-restart replays from offset. |
+
+**Redis failure — fail open vs fail closed:**
+
+GuardStream chooses **fail open**: when Redis is unreachable, the middleware logs an error and allows the request through rather than returning 500.
+
+```
+Fail closed: Redis down → every API request gets 500 → your API is down
+Fail open:   Redis down → rate limiting pauses → your API keeps serving
+```
+
+For a rate limiter, fail open is the right default. The risk (temporary loss of rate limiting) is less severe than the consequence (full API outage for all users). For stricter security requirements, change the `except` block in `middleware.py` to return a 503.
+
+**Redis persistence:** By default, Redis is configured without persistence (`appendonly no`). A Redis restart clears all blocks and counters. For production, add `--appendonly yes` to the Redis command or mount a volume with an `redis.conf`.
+
+---
+
+## Measured Performance
+
+Benchmarked on a MacBook with the full Docker Compose stack running locally.
+
+**Fast path latency** (Redis Lua script — the enforcer.check() call only):
+
+| Metric | Value |
+|--------|-------|
+| Average | 0.9 ms |
+| p50 | 0.7 ms |
+| p99 | 2.6 ms |
+
+**Load test** (`scripts/load_test.sh` — 50 concurrent requests):
+- 10 allowed, 40 blocked (limit=10 per window)
+- 0 errors — atomicity held under full concurrency
+
+**Resource usage** (full stack — Kafka + Redis + 4 services):
+- Redis memory: ~1.7 MB
+- No CPU overhead on the fast path between requests
+
+Live metrics available at `/api/metrics` while the stack is running.
+
+---
+
 ## Key Technical Decisions
 
 **Why a Lua script for the fast path?**

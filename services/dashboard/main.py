@@ -56,6 +56,36 @@ async def alerts():
     return result
 
 
+@app.get("/api/metrics")
+async def metrics():
+    latencies = redis_client.zrange("gs:metrics:fastpath_ms", 0, -1, withscores=True)
+    request_count = int(redis_client.get("gs:metrics:request_count") or 0)
+    blocked_count = int(redis_client.get("gs:stats:blocked_count") or 0)
+
+    info = redis_client.info("memory")
+    redis_memory_mb = round(info.get("used_memory", 0) / 1024 / 1024, 2)
+
+    if latencies:
+        vals = sorted(v for _, v in latencies)
+        n = len(vals)
+        p50 = round(vals[int(n * 0.50)], 3)
+        p99 = round(vals[int(n * 0.99)], 3)
+        avg = round(sum(vals) / n, 3)
+    else:
+        p50 = p99 = avg = 0.0
+
+    block_rate = round(blocked_count / request_count * 100, 1) if request_count else 0.0
+
+    return {
+        "fast_path_latency_ms": {"avg": avg, "p50": p50, "p99": p99},
+        "request_count": request_count,
+        "blocked_count": blocked_count,
+        "block_rate_pct": block_rate,
+        "redis_memory_mb": redis_memory_mb,
+        "latency_sample_size": len(latencies),
+    }
+
+
 @app.get("/api/alerts/{alert_id}")
 async def get_alert(alert_id: str):
     data = redis_client.hgetall(f"gs:alert:{alert_id}")
