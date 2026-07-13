@@ -183,31 +183,31 @@ For production deployment, GuardStream replaces every local container with a man
                          Internet
                              │
                      ┌───────▼────────┐
-                     │  AWS ALB        │  HTTP load balancer
+                     │  AWS ALB       │  HTTP load balancer
                      └───────┬────────┘
                              │
               ┌──────────────▼──────────────┐
-              │  Amazon ECS / Fargate        │  all 4 containers
-              │  demo │ ai-consumer          │  no servers to manage
-              │  stats-consumer │ dashboard  │
-              └──┬───────────┬─────────────┘
+              │  Amazon ECS / Fargate       │  all 4 containers
+              │  demo │ ai-consumer         │  no servers to manage
+              │  stats-consumer │ dashboard │
+              └──┬───────────┬───────────── ┘
                  │           │
      ┌───────────▼──┐  ┌────▼──────────────┐
-     │ Amazon MSK   │  │ Amazon ElastiCache │
-     │ (Kafka)      │  │ (Redis, Multi-AZ)  │
+     │ Amazon MSK   │  │ Amazon ElastiCache│
+     │ (Kafka)      │  │ (Redis, Multi-AZ) │
      └──────────────┘  └───────────────────┘
                  │
      ┌───────────▼──────────────────────────┐
-     │          ai-consumer                  │
-     │  Attack detected → writes to:         │
-     │                                       │
-     │  ┌──────────┐  ┌─────┐  ┌─────────┐ │
-     │  │ Redis    │  │ S3  │  │ SNS     │ │
-     │  │ (blocks  │  │ (90-│  │ (email/ │ │
-     │  │ +alerts) │  │ day │  │ Slack/  │ │
-     │  │          │  │ arc-│  │ Pager-  │ │
-     │  └──────────┘  │ hiv)│  │ Duty)   │ │
-     │                └─────┘  └─────────┘ │
+     │          ai-consumer                 │
+     │  Attack detected → writes to:        │
+     │                                      │
+     │  ┌──────────┐  ┌─────┐  ┌─────────┐  │
+     │  │ Redis    │  │ S3  │  │ SNS     │  │
+     │  │ (blocks  │  │ (90-│  │ (email/ │  │
+     │  │ +alerts) │  │ day │  │ Slack/  │  │
+     │  │          │  │ arc-│  │ Pager-  │  │
+     │  └──────────┘  │ hiv)│  │ Duty)   │  │
+     │                └─────┘  └─────────┘  │
      │  ┌───────────────────────────────┐   │
      │  │ CloudWatch (metrics + alarms) │   │
      │  └───────────────────────────────┘   │
